@@ -1,0 +1,670 @@
+﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router";
+import PageBreadcrumb from "../../components/common/PageBreadCrumb";
+import PageMeta from "../../components/common/PageMeta";
+import { ChatContent } from "../Teacher/ChatContent";
+import { apiBuildChat } from "../../apis/apiChat";
+import { apiGetMaterialList, apiGetMaterialTopics } from "../../apis/apiMaterial";
+import { showToastError, showToastWarning } from "../../utils/appUtils";
+import { useTeacherStore } from "../../store/teacher.store";
+import { useAuthStore } from "../../store/auth.store";
+import type { ChatMessage, TeacherChatSession, TpMaterialData, TpMaterialTopicData } from "../../types/commonTypes";
+
+type RouteParams = {
+  teacherId?: string;
+  sessionId?: string;
+};
+
+type TeacherTranscript = {
+  id: number;
+  title: string;
+  url: string;
+  text: string;
+};
+
+const MAX_RESPONSE_LENGTH = 900;
+const MAX_TRANSCRIPTS_FOR_PROMPT = 4;
+const concisePrompts = [
+  "Teacher note: keep the answer under roughly 750 characters while covering the key context and takeaways.",
+  "Teacher note: please answer in under about 500 characters, focusing on the essentials.",
+  "Teacher note: give a quick reminder in under 300 characters with just the must-know fact.",
+];
+
+
+
+const DEV_BACKEND_BASE_URL = (() => {
+  const rawUrl = String(((import.meta.env as any).VITE_SERVER_URL ?? "")).trim();
+  return rawUrl.endsWith("/") ? rawUrl.slice(0, -1) : rawUrl;
+})();
+
+const resolveTranscriptUrl = (input: string) => {
+  if (!input) {
+    return "";
+  }
+
+  if (import.meta.env.DEV) {
+    if (input.startsWith("/api/")) {
+      return input;
+    }
+
+    if (input.startsWith("/")) {
+      const normalized = input === "/" ? "/" : input.replace(/^\/+/, "/");
+      if (normalized.startsWith("/api/")) {
+        return normalized;
+      }
+      return "/api" + normalized;
+    }
+
+    try {
+      const absolute = new URL(input);
+      if (DEV_BACKEND_BASE_URL) {
+        const backendOrigin = new URL(DEV_BACKEND_BASE_URL).origin;
+        if (absolute.origin === backendOrigin) {
+          return "/api" + absolute.pathname + absolute.search + absolute.hash;
+        }
+      }
+    } catch {
+      if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(input)) {
+        const trimmed = input.replace(/^\/+/, "");
+        return "/api/" + trimmed;
+      }
+    }
+  }
+
+  return input;
+};
+
+const createId = () => {
+  const globalCrypto = typeof globalThis !== "undefined" ? (globalThis as any).crypto : undefined;
+  if (globalCrypto?.randomUUID) {
+    return globalCrypto.randomUUID();
+  }
+  return Math.random().toString(36).slice(2, 10);
+};
+
+const normalizeMaterialKey = (value?: string | null) => {
+  if (!value) {
+    return "";
+  }
+  return value
+    .toLowerCase()
+    .replace(/\.[^/.]+$/, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
+const stripVttFormatting = (raw: string) => {
+  if (!raw) {
+    return "";
+  }
+  return raw
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return false;
+      }
+      if (trimmed === "WEBVTT") {
+        return false;
+      }
+      if (/^\d+$/.test(trimmed)) {
+        return false;
+      }
+      if (/^\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}$/.test(trimmed)) {
+        return false;
+      }
+      return true;
+    })
+    .join("\n")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+};
+
+const limitTranscript = (text: string, limit = 6000) => {
+  if (!text) {
+    return "";
+  }
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(limit - 3, 0))}...`;
+};
+
+const fetchTranscriptText = async (url: string, token?: string) => {
+  if (!url) {
+    return "";
+  }
+
+  const resolvedUrl = resolveTranscriptUrl(url);
+
+  try {
+    const response = await fetch(resolvedUrl, {
+      headers: token ? { Authorization: "Bearer " + token } : undefined,
+    });
+    if (!response.ok) {
+      console.error("Failed to fetch transcript", resolvedUrl, response.status);
+      return "";
+    }
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const data = await response.json();
+      const candidate =
+        typeof data === "string"
+          ? data
+          : data?.transcript ?? data?.text ?? JSON.stringify(data);
+      return stripVttFormatting(String(candidate));
+    }
+    const raw = await response.text();
+    return stripVttFormatting(raw);
+  } catch (error) {
+    console.error("Unable to fetch transcript", resolvedUrl, error);
+    return "";
+  }
+};
+
+const TeacherChatPage = () => {
+  const params = useParams<RouteParams>();
+  const navigate = useNavigate();
+  const teacherId = params.teacherId ?? "";
+  const sessionParam = params.sessionId;
+
+  const chatSessions = useTeacherStore((state) => state.chatSessions);
+  const maxChatSessionsPerTeacher = useTeacherStore((state) => state.maxChatSessionsPerTeacher);
+  const startChatSession = useTeacherStore((state) => state.startChatSession);
+  const setActiveSession = useTeacherStore((state) => state.setActiveSession);
+  const replaceSessionMessages = useTeacherStore((state) => state.replaceSessionMessages);
+  const appendMessage = useTeacherStore((state) => state.appendMessage);
+  const getTeacherById = useTeacherStore((state) => state.getTeacherById);
+  const authUser = useAuthStore((state) => state.user);
+
+  const teacher = useMemo(() => getTeacherById(teacherId), [getTeacherById, teacherId]);
+  const teacherSessions = useMemo(() => {
+    return chatSessions
+      .filter((item) => item.teacherId === teacherId)
+      .slice()
+      .sort((a, b) => {
+        const aTime = new Date(a.createdAt ?? "").getTime() || 0;
+        const bTime = new Date(b.createdAt ?? "").getTime() || 0;
+        return bTime - aTime;
+      });
+  }, [chatSessions, teacherId]);
+
+  const chatLimit = Math.max(maxChatSessionsPerTeacher ?? 1, 1);
+  const remainingSlots = Math.max(chatLimit - teacherSessions.length, 0);
+
+  const [session, setSession] = useState<TeacherChatSession | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [isSending, setIsSending] = useState(false);
+  const [knowledge, setKnowledge] = useState<TeacherTranscript[]>([]);
+  const [isLoadingKnowledge, setIsLoadingKnowledge] = useState(false);
+  const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!teacherId) {
+      navigate("/dashboard", { replace: true });
+    }
+  }, [teacherId, navigate]);
+
+  useEffect(() => {
+    if (!teacher) {
+      navigate("/dashboard", { replace: true });
+      return;
+    }
+
+    const existing = sessionParam ? chatSessions.find((s) => s.id === sessionParam) : undefined;
+    const nextSession = existing ?? startChatSession(teacherId);
+    if (!existing) {
+      navigate(`/teachers/${teacherId}/chat/${nextSession.id}`, { replace: true });
+    }
+    setSession(nextSession);
+    setActiveSession(nextSession.id);
+  }, [teacher, teacherId, sessionParam, chatSessions, startChatSession, setActiveSession, navigate]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    const latest = chatSessions.find((item) => item.id === session.id);
+    if (latest) {
+      setSession(latest);
+      setMessages(latest.messages);
+    }
+  }, [chatSessions, session]);
+
+  useEffect(() => {
+    if (!session || !teacher) {
+      return;
+    }
+    if (session.messages.length === 0) {
+      const greeting: ChatMessage = {
+        id: createId(),
+        role: "assistant",
+        text: `Hi, I'm ${teacher.name}. Ask anything about our topic and I''ll answer with the same cadence you know from class.`,
+        time: Date.now(),
+      };
+      replaceSessionMessages(session.id, [greeting]);
+    }
+  }, [session, teacher, replaceSessionMessages]);
+
+  useEffect(() => {
+    let isActive = true;
+
+    if (!teacher) {
+      setKnowledge([]);
+      setKnowledgeError(null);
+      setIsLoadingKnowledge(false);
+      return () => {
+        isActive = false;
+      };
+    }
+
+    const fetchTopics = () =>
+      new Promise<TpMaterialTopicData[]>((resolve) => {
+        apiGetMaterialTopics((code, result) => {
+          if (code === 200 && Array.isArray(result?.body)) {
+            resolve(result.body as TpMaterialTopicData[]);
+          } else {
+            const message =
+              typeof result === "string"
+                ? result
+                : result?.message || "Unable to load topics.";
+            console.warn("Unable to load topics:", message);
+            resolve([]);
+          }
+        });
+      });
+
+    const fetchMaterialsForTopic = (topicId: number) =>
+      new Promise<TpMaterialData[]>((resolve) => {
+        apiGetMaterialList({ topicId, userId: authUser?.id }, (code, result) => {
+          if (code === 200 && Array.isArray(result?.body)) {
+            resolve(result.body as TpMaterialData[]);
+          } else {
+            const message =
+              typeof result === "string"
+                ? result
+                : result?.message || "Unable to load materials.";
+            console.warn("Unable to load materials for topic", topicId, message);
+            resolve([]);
+          }
+        });
+      });
+
+    const hydrateKnowledge = async () => {
+      setIsLoadingKnowledge(true);
+      setKnowledgeError(null);
+
+      try {
+        const topics = await fetchTopics();
+        const topicIds = new Set<number>([0]);
+        topics.forEach((topic) => {
+          if (typeof topic?.id === "number") {
+            topicIds.add(topic.id);
+          }
+        });
+
+        const materialLists = await Promise.all(
+          Array.from(topicIds).map((topicId) => fetchMaterialsForTopic(topicId))
+        );
+
+        if (!isActive) {
+          return;
+        }
+
+        const allMaterials = materialLists.flat().filter((item): item is TpMaterialData => Boolean(item));
+
+        if (allMaterials.length === 0) {
+          setKnowledge([]);
+          setKnowledgeError("No transcripts available yet.");
+          setIsLoadingKnowledge(false);
+          return;
+        }
+
+        const teacherKeys = new Set(
+          (teacher.materials ?? [])
+            .map((material) => normalizeMaterialKey(material.name))
+            .filter((key) => key.length > 0)
+        );
+
+        const prioritized = allMaterials.filter((material) => {
+          if (teacherKeys.size === 0) {
+            return true;
+          }
+          return teacherKeys.has(normalizeMaterialKey(material.scriptTitle));
+        });
+
+        const selected = (prioritized.length > 0 ? prioritized : allMaterials).slice(
+          0,
+          MAX_TRANSCRIPTS_FOR_PROMPT
+        );
+
+        if (selected.length === 0) {
+          setKnowledge([]);
+          setKnowledgeError("No transcripts available yet.");
+          setIsLoadingKnowledge(false);
+          return;
+        }
+
+        const transcripts: TeacherTranscript[] = [];
+        for (const material of selected) {
+          if (!isActive) {
+            return;
+          }
+          const transcriptText = await fetchTranscriptText(material.scriptUrl, authUser?.token);
+          if (!isActive) {
+            return;
+          }
+          const cleanText = limitTranscript(transcriptText);
+          if (cleanText) {
+            transcripts.push({
+              id: material.id,
+              title: material.scriptTitle || `Material ${material.id}`,
+              url: material.scriptUrl,
+              text: cleanText,
+            });
+          }
+        }
+
+        if (!isActive) {
+          return;
+        }
+
+        if (transcripts.length === 0) {
+          setKnowledge([]);
+          setKnowledgeError("No transcripts available yet.");
+        } else {
+          setKnowledge(transcripts);
+          setKnowledgeError(null);
+        }
+        setIsLoadingKnowledge(false);
+      } catch (error) {
+        if (!isActive) {
+          return;
+        }
+        console.error("Failed to prepare transcripts", error);
+        setKnowledge([]);
+        setKnowledgeError("Unable to prepare transcript knowledge.");
+        setIsLoadingKnowledge(false);
+      }
+    };
+
+    hydrateKnowledge();
+
+    return () => {
+      isActive = false;
+    };
+  }, [teacher, authUser?.token]);
+
+  const buildPrompt = useCallback(
+    (question: string) => {
+      if (!teacher) {
+        return question;
+      }
+
+      const identityLines = [
+        `Teacher name: ${teacher.name}`,
+        `Teacher gender: ${teacher.gender}`,
+      ];
+
+      const persona = (teacher.context || "").trim();
+      if (persona) {
+        identityLines.push(`Persona notes: ${persona}`);
+      }
+
+      const materialNames = (teacher.materials ?? [])
+        .map((material) => material.name)
+        .filter((name) => name && name.length > 0);
+
+      if (materialNames.length > 0) {
+        identityLines.push(`Uploaded materials: ${materialNames.join(", ")}`);
+      }
+
+      const knowledgeSection = knowledge.length
+        ? knowledge
+            .slice(0, MAX_TRANSCRIPTS_FOR_PROMPT)
+            .map((entry, index) => {
+              const label = `Transcript ${index + 1}: ${entry.title}`;
+              return [label, entry.text].join("\n");
+            })
+            .join("\n\n")
+        : "No transcript excerpts were found for this teacher yet.";
+
+      const directives = [
+        `Always speak as the teacher named "${teacher.name}".`,
+        `If asked for your name, answer with "${teacher.name}".`,
+        "Rely exclusively on the transcript excerpts above.",
+        "If the answer cannot be found there, say you do not have that information yet.",
+        "Mirror unique phrases or cadence found in the transcripts when possible.",
+      ].join(" ");
+
+      return [
+        identityLines.join("\n"),
+        "Transcript knowledge:",
+        knowledgeSection,
+        "Student question:",
+        question,
+        directives,
+      ].join("\n\n");
+    },
+    [teacher, knowledge]
+  );
+
+  const sendQuestion = (originalQuestion: string, attempt = 1) => {
+    const instructionIndex = attempt - 2;
+    const instruction = instructionIndex >= 0 ? concisePrompts[Math.min(instructionIndex, concisePrompts.length - 1)] : "";
+    const payloadQuestion = instruction ? `${originalQuestion}\n\n${instruction}` : originalQuestion;
+    const enrichedQuestion = buildPrompt(payloadQuestion);
+
+    const requestPayload = {
+      teacherId,
+      sessionId: session?.id,
+      question: enrichedQuestion,
+    };
+
+    apiBuildChat(requestPayload, (code, result) => {
+      if (code !== 200) {
+        const errorMessageRaw =
+          typeof result === "string"
+            ? result
+            : result?.body?.message || result?.message || "Sorry, I couldn't reach the teaching service.";
+        const errorMessage = String(errorMessageRaw);
+
+        if (errorMessage.includes("Data too long for column 'response'") && instructionIndex + 1 < concisePrompts.length) {
+          sendQuestion(originalQuestion, attempt + 1);
+          return;
+        }
+
+        showToastError(errorMessage);
+
+        const failureReply: ChatMessage = {
+          id: createId(),
+          role: "assistant",
+          text: "I had trouble contacting the teacher service. Please try again in a moment.",
+          time: Date.now(),
+        };
+        if (session) {
+          appendMessage(session.id, failureReply);
+        }
+        setMessages((prev) => prev.concat(failureReply));
+        setIsSending(false);
+        return;
+      }
+
+      const responseTextRaw =
+        result?.body?.response ?? result?.body?.message ?? result?.response ?? "";
+      const cleanText = String(responseTextRaw ?? "").trim();
+      const isTooLong = cleanText.length > MAX_RESPONSE_LENGTH;
+      const safeText = isTooLong ? `${cleanText.slice(0, MAX_RESPONSE_LENGTH - 1)}.` : cleanText;
+
+      if (isTooLong) {
+        showToastWarning("Response shortened to fit chat history.");
+      }
+
+      const assistantReply: ChatMessage = {
+        id: createId(),
+        role: "assistant",
+        text: safeText || "I'm here when you''re ready with another question!",
+        time: Date.now(),
+      };
+
+      if (session) {
+        appendMessage(session.id, assistantReply);
+      }
+      setMessages((prev) => prev.concat(assistantReply));
+      setIsSending(false);
+    });
+  };
+
+  const handleSend = () => {
+    if (!session || !teacher) {
+      return;
+    }
+    if (isLoadingKnowledge) {
+      showToastWarning("Hold on - I'm still loading this teacher''s transcript.");
+      return;
+    }
+    const trimmed = input.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const userMessage: ChatMessage = {
+      id: createId(),
+      role: "user",
+      text: trimmed,
+      time: Date.now(),
+    };
+
+    appendMessage(session.id, userMessage);
+    setMessages((prev) => prev.concat(userMessage));
+    setInput("");
+    setIsSending(true);
+
+    sendQuestion(trimmed, 1);
+  };
+
+  const handleStartNewChat = () => {
+    if (!teacherId) {
+      return;
+    }
+    const freshSession = startChatSession(teacherId);
+    navigate(`/teachers/${teacherId}/chat/${freshSession.id}`);
+  };
+
+  const handleSelectSession = (sessionId: string) => {
+    if (!sessionId || sessionId === session?.id) {
+      return;
+    }
+    navigate(`/teachers/${teacherId}/chat/${sessionId}`);
+  };
+
+  if (!teacher || !session) {
+    return null;
+  }
+
+  return (
+    <>
+      <PageMeta />
+      <PageBreadcrumb pageTitle={`${teacher.name} Chat`} />
+      <div className="space-y-4">
+        <div className="rounded-2xl border border-gray-200 bg-white p-4 text-sm text-gray-600 dark:border-gray-800 dark:bg-white/[0.03] dark:text-gray-300">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <p>
+              Chatting with <span className="font-semibold text-gray-800 dark:text-white/90">{teacher.name}</span>. You can keep up to {chatLimit} saved chat{chatLimit === 1 ? "" : "s"} with this teacher.
+            </p>
+            <span className="text-xs text-gray-400 dark:text-gray-500">
+              {remainingSlots > 0
+                ? `${remainingSlots} new chat${remainingSlots === 1 ? "" : "s"} available`
+                : "Starting a new chat replaces the oldest conversation"}
+            </span>
+          </div>
+        </div>
+        <div className="rounded-2xl border border-gray-200 bg-white p-4 text-sm text-gray-600 dark:border-gray-800 dark:bg-white/[0.03] dark:text-gray-300">
+          {isLoadingKnowledge ? (
+            <span>Loading transcript knowledge for {teacher.name}...</span>
+          ) : knowledge.length > 0 ? (
+            <span>
+              Using {knowledge.length} transcript{knowledge.length === 1 ? "" : "s"} to shape answers.
+            </span>
+          ) : (
+            <span>No transcripts were matched yet. Responses will rely on persona details.</span>
+          )}
+          {knowledgeError && (
+            <span className="mt-2 block text-xs text-red-500 dark:text-red-300">{knowledgeError}</span>
+          )}
+        </div>
+        <ChatContent
+          messages={messages}
+          setMessages={setMessages}
+          isSending={isSending}
+          setIsSending={setIsSending}
+          input={input}
+          setInput={setInput}
+          handleSend={handleSend}
+          canSend={Boolean(input.trim()) && !isSending && !isLoadingKnowledge}
+        />
+        <div className="rounded-2xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-white/[0.03]">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-gray-800 dark:text-white/90">Previous chats</h2>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Switch to an earlier session or start fresh to ask something new.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleStartNewChat}
+              className="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700"
+            >
+              Start new chat
+            </button>
+          </div>
+          {teacherSessions.length === 0 ? (
+            <div className="mt-4 rounded-xl border border-dashed border-gray-300 p-4 text-xs text-gray-500 dark:border-gray-700 dark:text-gray-400">
+              No chat history yet. Send your first question to get started.
+            </div>
+          ) : (
+            <ul className="mt-4 space-y-2">
+              {teacherSessions.map((item) => {
+                const latestMessage = item.messages.length ? item.messages[item.messages.length - 1] : undefined;
+                const createdAt = new Date(item.createdAt ?? Date.now()).toLocaleString();
+                const isActive = item.id === session.id;
+                return (
+                  <li key={item.id}>
+                    <button
+                      type="button"
+                      onClick={() => handleSelectSession(item.id)}
+                      className={`w-full rounded-xl border px-4 py-3 text-left text-sm transition ${
+                        isActive
+                          ? "border-indigo-500 bg-indigo-50 dark:border-indigo-500/80 dark:bg-indigo-900/30"
+                          : "border-gray-200 bg-white hover:border-indigo-400 hover:bg-indigo-50 dark:border-gray-700 dark:bg-gray-900/40 dark:hover:border-indigo-500 dark:hover:bg-indigo-900/20"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-gray-800 dark:text-white/90">Started {createdAt}</span>
+                        <span className="text-xs text-gray-400 dark:text-gray-500">
+                          {item.messages.length} message{item.messages.length === 1 ? "" : "s"}
+                        </span>
+                      </div>
+                      {latestMessage && (
+                        <p className="mt-1 max-h-12 overflow-hidden text-xs text-gray-500 dark:text-gray-400">
+                          {latestMessage.text}
+                        </p>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+    </>
+  );
+};
+
+export default TeacherChatPage;
+
